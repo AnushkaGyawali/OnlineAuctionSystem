@@ -1,39 +1,26 @@
 {
-  "name": "onlineauctionsystem",
+  "name": "online-auction-system",
   "version": "1.0.0",
-  "description": "Real-time product bidding system built with PHP and JavaScript.",
+  "description": "An Online Auction System built with PHP, MySQL, HTML, CSS, and JavaScript.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build-css": "npx tailwindcss -i ./assets/css/style.css -o ./assets/css/style.css"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/AnushkaGyawali/OnlineAuctionSystem.git"
-  },
-  "keywords": [],
+  "keywords": [
+    "auction",
+    "php",
+    "mysql",
+    "html",
+    "css",
+    "javascript",
+    "tailwind"
+  ],
   "author": "",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/AnushkaGyawali/OnlineAuctionSystem/issues"
-  },
-  "homepage": "https://github.com/AnushkaGyawali/OnlineAuctionSystem#readme",
   "devDependencies": {
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4"
-  },
-  "dependencies": {
-    "browserslist": "^4.25.1",
-    "caniuse-lite": "^1.0.30001727",
-    "electron-to-chromium": "^1.5.191",
-    "escalade": "^3.2.0",
-    "fraction.js": "^4.3.7",
-    "nanoid": "^3.3.11",
-    "node-releases": "^2.0.19",
-    "normalize-range": "^0.1.2",
-    "picocolors": "^1.1.1",
-    "postcss-value-parser": "^4.2.0",
-    "source-map-js": "^1.2.1",
-    "update-browserslist-db": "^1.1.3"
   }
 }
