@@ -1,5 +1,5 @@
 <?php
-// includes/auth_functions.php - Reusable authentication functions
+// includes/auth_functions.php - Reusable authentication and auction helper functions
 
 /**
  * Hashes a given password securely.
@@ -7,8 +7,6 @@
  * @return string The hashed password.
  */
 function hashPassword(string $password): string {
-    // PASSWORD_ARGON2ID is recommended for new applications.
-    // PASSWORD_BCRYPT is also a strong option and widely supported.
     return password_hash($password, PASSWORD_ARGON2ID);
 }
 
@@ -116,4 +114,25 @@ function logoutUser() {
     // Destroy the session
     session_destroy();
 }
-?>
+
+/**
+ * Calculates the appropriate bid increment based on the current bid.
+ * This can be customized based on auction rules.
+ * @param float $currentBid The current highest bid amount.
+ * @return float The recommended bid increment.
+ */
+function getNextBidIncrement(float $currentBid): float {
+    if ($currentBid < 10.00) {
+        return 0.50;
+    } elseif ($currentBid < 50.00) {
+        return 1.00;
+    } elseif ($currentBid < 100.00) {
+        return 2.50;
+    } elseif ($currentBid < 500.00) {
+        return 5.00;
+    } elseif ($currentBid < 1000.00) {
+        return 10.00;
+    } else {
+        return 25.00;
+    }
+}

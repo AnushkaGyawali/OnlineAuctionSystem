@@ -22,7 +22,7 @@ try {
     $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
 
     // the line below IS FOR  debugging to confirm connection IF NOT NEEDED CAN BE COMMEMTED 
-     echo "Database connection successful!";
+    // echo "Database connection successful!";
 
 } catch (PDOException $e) {
     // If connection fails, log the error and terminate the script

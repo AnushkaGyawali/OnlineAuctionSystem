@@ -66,7 +66,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <form action="login.php" method="POST">
                 <div class="mb-4">
-                    <label for="username_or_email" class="block text-gray-700 text-sm font-bold mb-2">Username or Email:</label>
+                    <label for="username_or_email" class="block text-gray-700 text-sm font-bold mb-2">Username/Email:</label>
                     <input type="text" id="username_or_email" name="username_or_email" class="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-olivine-2 focus:border-transparent" required value="<?php echo htmlspecialchars($usernameOrEmail ?? ''); ?>">
                 </div>
                 <div class="mb-6">

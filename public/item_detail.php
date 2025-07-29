@@ -4,13 +4,18 @@
 session_start();
 
 require_once __DIR__ . '/../config/db.php';
-require_once __DIR__ . '/../includes/auth_functions.php'; // For isLoggedIn()
+require_once __DIR__ . '/../includes/auth_functions.php'; // For isLoggedIn(), getNextBidIncrement()
 
 $message = '';
 $item = null;
 $item_id = $_GET['id'] ?? 0; // Get item ID from URL
 $current_user_id = isLoggedIn() ? $_SESSION['user_id'] : null;
 $bid_history = [];
+$next_min_bid_display = 0.01; // Default for display before item is fetched
+
+// Anti-sniping configuration
+const ANTI_SNIPING_GRACE_PERIOD_SECONDS = 300; // Extend auction by this many seconds (e.g., 5 minutes) if bid placed in last X seconds
+const ANTI_SNIPING_EXTENSION_SECONDS = 300;    // Extend auction by this amount (e.g., 5 minutes)
 
 // --- Fetch Item Details ---
 if ($item_id) {
@@ -31,7 +36,8 @@ if ($item_id) {
                 i.image_urls,
                 u.username AS seller_username,
                 u.id AS seller_id,
-                hb.username AS highest_bidder_username
+                hb.username AS highest_bidder_username,
+                (SELECT proxy_max_amount FROM bids WHERE item_id = i.id AND bidder_id = i.highest_bidder_id ORDER BY bid_time DESC LIMIT 1) AS highest_bidder_proxy_max
             FROM
                 items i
             JOIN
@@ -50,12 +56,18 @@ if ($item_id) {
             // Decode image_urls JSON
             $item['image_urls'] = json_decode($item['image_urls'] ?? '[]', true);
 
+            // Calculate next minimum bid for display
+            $current_effective_bid = $item['current_bid'] ?? $item['start_price'];
+            $next_min_bid_display = $current_effective_bid + getNextBidIncrement($current_effective_bid);
+
             // Fetch bid history for this item
             $stmt_bids = $pdo->prepare("
                 SELECT
                     b.bid_amount,
                     b.bid_time,
-                    u.username AS bidder_username
+                    u.username AS bidder_username,
+                    b.is_proxy_bid,
+                    b.proxy_max_amount
                 FROM
                     bids b
                 JOIN
@@ -87,45 +99,126 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_bid'])) {
     } elseif ($current_user_id === $item['seller_id']) {
         $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">You cannot bid on your own item.</div>';
     } else {
-        $bid_amount = floatval($_POST['bid_amount'] ?? 0);
-        $current_highest_bid = $item['current_bid'] ?? $item['start_price'];
-        $next_min_bid = $current_highest_bid + 0.01; // Simple minimum increment
+        $user_bid_amount = floatval($_POST['bid_amount'] ?? 0);
+        $user_proxy_max = !empty($_POST['proxy_max_amount']) ? floatval($_POST['proxy_max_amount']) : NULL;
 
-        if ($bid_amount <= 0) {
-            $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Bid amount must be positive.</div>';
-        } elseif ($bid_amount < $next_min_bid) {
-            $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Your bid must be at least $' . number_format($next_min_bid, 2) . '.</div>';
+        // Re-fetch item data inside the POST request to ensure it's fresh
+        // This helps prevent race conditions, though a full locking mechanism would be more robust
+        $stmt_re_fetch = $pdo->prepare("
+            SELECT
+                i.id,
+                i.title,
+                i.start_price,
+                i.current_bid,
+                i.highest_bidder_id,
+                i.end_time, -- Fetch end_time for anti-sniping check
+                (SELECT proxy_max_amount FROM bids WHERE item_id = i.id AND bidder_id = i.highest_bidder_id ORDER BY bid_time DESC LIMIT 1) AS highest_bidder_proxy_max
+            FROM
+                items i
+            WHERE
+                i.id = ?
+        ");
+        $stmt_re_fetch->execute([$item_id]);
+        $fresh_item = $stmt_re_fetch->fetch();
+
+        if (!$fresh_item) {
+            $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Item not found or auction state changed.</div>';
         } else {
-            try {
-                // Start a transaction for atomicity
-                $pdo->beginTransaction();
+            $current_effective_bid = $fresh_item['current_bid'] ?? $fresh_item['start_price'];
+            $next_min_increment = getNextBidIncrement($current_effective_bid);
+            $next_min_bid_required = $current_effective_bid + $next_min_increment;
 
-                // 1. Insert the new bid
-                $stmt_insert_bid = $pdo->prepare("INSERT INTO bids (item_id, bidder_id, bid_amount) VALUES (?, ?, ?)");
-                $stmt_insert_bid->execute([$item_id, $current_user_id, $bid_amount]);
+            if ($user_bid_amount <= 0) {
+                $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Bid amount must be positive.</div>';
+            } elseif ($user_bid_amount < $next_min_bid_required) {
+                $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Your bid must be at least $' . number_format($next_min_bid_required, 2) . '.</div>';
+            } elseif ($user_proxy_max !== NULL && $user_proxy_max < $user_bid_amount) {
+                $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Your maximum bid cannot be less than your current bid.</div>';
+            } else {
+                try {
+                    $pdo->beginTransaction();
 
-                // 2. Update the item's current_bid and highest_bidder_id
-                $stmt_update_item = $pdo->prepare("UPDATE items SET current_bid = ?, highest_bidder_id = ? WHERE id = ?");
-                $stmt_update_item->execute([$bid_amount, $current_user_id, $item_id]);
+                    $new_current_bid = $user_bid_amount;
+                    $new_highest_bidder_id = $current_user_id;
+                    $is_proxy = ($user_proxy_max !== NULL);
+                    $new_end_time = $fresh_item['end_time']; // Initialize with current end time
 
-                $pdo->commit(); // Commit the transaction
+                    // Logic for Proxy Bidding (Ascending Clock Algorithm simulation)
+                    $highest_bidder_id_before = $fresh_item['highest_bidder_id'];
+                    $highest_bidder_proxy_max_before = $fresh_item['highest_bidder_proxy_max'];
 
-                $message = '<div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative mb-4" role="alert">Your bid of $' . number_format($bid_amount, 2) . ' has been placed successfully!</div>';
+                    if ($highest_bidder_id_before !== NULL && $highest_bidder_id_before !== $current_user_id) {
+                        // There's an existing highest bidder who is not the current user
+                        if ($highest_bidder_proxy_max_before !== NULL && $highest_bidder_proxy_max_before >= $user_bid_amount) {
+                            // Current highest bidder has a proxy bid that can beat the incoming bid
+                            $new_current_bid = $user_bid_amount + $next_min_increment;
+                            if ($new_current_bid > $highest_bidder_proxy_max_before) {
+                                // If the new calculated bid exceeds the current highest bidder's proxy max,
+                                // the new user becomes the highest bidder at the current highest bidder's proxy max + increment.
+                                $new_current_bid = $highest_bidder_proxy_max_before + $next_min_increment;
+                                // But if the incoming user's bid is still lower than this new_current_bid,
+                                // then the current highest bidder remains the winner at their proxy max.
+                                if ($user_bid_amount < $new_current_bid) {
+                                    $new_current_bid = min($user_bid_amount, $highest_bidder_proxy_max_before); // Bid up to just beat the incoming bid
+                                    if ($new_current_bid < $next_min_bid_required) {
+                                        $new_current_bid = $next_min_bid_required;
+                                    }
+                                }
+                                $new_highest_bidder_id = $highest_bidder_id_before; // Current highest bidder remains
+                                $message = '<div class="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded relative mb-4" role="alert">You were outbid by a proxy bid. Current bid is now $' . number_format($new_current_bid, 2) . '.</div>';
+                            } else {
+                                // Current highest bidder's proxy bid is higher than or equal to incoming bid
+                                // The current highest bidder remains, bid increases by increment
+                                $new_current_bid = $user_bid_amount; // Bid up to the incoming bid
+                                $new_highest_bidder_id = $highest_bidder_id_before; // Current highest bidder remains
+                                $message = '<div class="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded relative mb-4" role="alert">You were outbid by a proxy bid. Current bid is now $' . number_format($new_current_bid, 2) . '.</div>';
+                            }
+                        }
+                    }
 
-                // Refresh item data after successful bid to show updated current bid
-                header("Location: item_detail.php?id=" . $item_id);
-                exit();
+                    // Ensure the new_current_bid is at least the next_min_bid_required
+                    // This handles cases where user bids just the minimum, or if proxy logic resulted in a lower value
+                    $new_current_bid = max($new_current_bid, $next_min_bid_required);
 
-            } catch (PDOException $e) {
-                $pdo->rollBack(); // Rollback on error
-                error_log("Bid placement failed: " . $e->getMessage());
-                $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Failed to place bid due to a server error. Please try again.</div>';
+                    // Anti-Sniping Logic
+                    $time_left = strtotime($fresh_item['end_time']) - time();
+                    if ($time_left < ANTI_SNIPING_GRACE_PERIOD_SECONDS) {
+                        // If bid is placed within the grace period, extend the auction end time
+                        $new_end_time = date('Y-m-d H:i:s', strtotime($fresh_item['end_time']) + ANTI_SNIPING_EXTENSION_SECONDS);
+                        $message .= '<div class="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative mt-2" role="alert">Auction extended due to last-minute bid!</div>';
+                    }
+
+
+                    // 1. Insert the new bid (always record the user's actual bid and proxy max)
+                    $stmt_insert_bid = $pdo->prepare("INSERT INTO bids (item_id, bidder_id, bid_amount, is_proxy_bid, proxy_max_amount) VALUES (?, ?, ?, ?, ?)");
+                    $stmt_insert_bid->execute([$item_id, $current_user_id, $user_bid_amount, $is_proxy, $user_proxy_max]);
+
+                    // 2. Update the item's current_bid, highest_bidder_id, and end_time based on the new logic
+                    $stmt_update_item = $pdo->prepare("UPDATE items SET current_bid = ?, highest_bidder_id = ?, end_time = ? WHERE id = ?");
+                    $stmt_update_item->execute([$new_current_bid, $new_highest_bidder_id, $new_end_time, $item_id]);
+
+                    $pdo->commit(); // Commit the transaction
+
+                    // If the user is the new highest bidder, display success
+                    if ($new_highest_bidder_id === $current_user_id) {
+                        $_SESSION['success_message'] = 'Your bid of $' . number_format($user_bid_amount, 2) . ' has been placed successfully! You are the highest bidder.';
+                    }
+                    // If the user was outbid by a proxy, the message is already set above
+
+                    header("Location: item_detail.php?id=" . $item_id); // Redirect to refresh data
+                    exit();
+
+                } catch (PDOException $e) {
+                    $pdo->rollBack(); // Rollback on error
+                    error_log("Bid placement failed: " . $e->getMessage());
+                    $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">Failed to place bid due to a server error. Please try again.</div>';
+                }
             }
         }
     }
 }
 
-// --- Handle Buy Now ---
+// --- Handle Buy Now (remains mostly the same, but ensure it's integrated with proxy logic) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['buy_now'])) {
     if (!isLoggedIn()) {
         $message = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">You must be logged in to use Buy Now.</div>';
@@ -179,6 +272,12 @@ if (isLoggedIn()) {
         <li><a href="login.php" class="text-white hover:text-nyanza font-semibold py-2 transition-colors duration-300">Login</a></li>
         <li><a href="register.php" class="text-white hover:text-nyanza font-semibold py-2 transition-colors duration-300">Register</a></li>
     ';
+}
+
+// Display session messages (e.g., from successful bid redirect)
+if (isset($_SESSION['success_message'])) {
+    $message = '<div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative mb-4" role="alert">' . htmlspecialchars($_SESSION['success_message']) . '</div>';
+    unset($_SESSION['success_message']);
 }
 ?>
 <!DOCTYPE html>
@@ -270,8 +369,13 @@ if (isLoggedIn()) {
                                 <form action="item_detail.php?id=<?php echo htmlspecialchars($item['id']); ?>" method="POST" class="mb-4">
                                     <div class="mb-4">
                                         <label for="bid_amount" class="block text-gray-700 text-sm font-bold mb-2">Your Bid ($):</label>
-                                        <input type="number" id="bid_amount" name="bid_amount" step="0.01" min="<?php echo number_format(($item['current_bid'] ?? $item['start_price']) + 0.01, 2, '.', ''); ?>" class="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-olivine-2 focus:border-transparent" required>
-                                        <p class="text-xs text-gray-500 mt-1">Minimum bid: $<?php echo number_format(($item['current_bid'] ?? $item['start_price']) + 0.01, 2); ?></p>
+                                        <input type="number" id="bid_amount" name="bid_amount" step="0.01" min="<?php echo number_format($next_min_bid_display, 2, '.', ''); ?>" class="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-olivine-2 focus:border-transparent" required>
+                                        <p class="text-xs text-gray-500 mt-1">Minimum bid: $<?php echo number_format($next_min_bid_display, 2); ?></p>
+                                    </div>
+                                    <div class="mb-6">
+                                        <label for="proxy_max_amount" class="block text-gray-700 text-sm font-bold mb-2">Your Maximum (Proxy) Bid (Optional $):</label>
+                                        <input type="number" id="proxy_max_amount" name="proxy_max_amount" step="0.01" min="<?php echo number_format($next_min_bid_display, 2, '.', ''); ?>" class="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-olivine-2 focus:border-transparent">
+                                        <p class="text-xs text-gray-500 mt-1">The system will bid for you up to this amount.</p>
                                     </div>
                                     <button type="submit" name="place_bid" class="bg-moss-green hover:bg-reseda-green text-white font-bold py-3 px-6 rounded-lg focus:outline-none focus:shadow-outline transition-all duration-300 w-full">Place Bid</button>
                                 </form>
@@ -311,6 +415,7 @@ if (isLoggedIn()) {
                                     <tr class="bg-tea-green text-left text-gray-700">
                                         <th class="py-3 px-4 border-b border-olivine">Bidder</th>
                                         <th class="py-3 px-4 border-b border-olivine">Bid Amount</th>
+                                        <th class="py-3 px-4 border-b border-olivine">Type</th>
                                         <th class="py-3 px-4 border-b border-olivine">Bid Time</th>
                                     </tr>
                                 </thead>
@@ -319,6 +424,14 @@ if (isLoggedIn()) {
                                         <tr class="hover:bg-nyanza">
                                             <td class="py-3 px-4 border-b border-olivine-2"><?php echo htmlspecialchars($bid['bidder_username']); ?></td>
                                             <td class="py-3 px-4 border-b border-olivine-2 font-semibold text-reseda-green">$<?php echo number_format($bid['bid_amount'], 2); ?></td>
+                                            <td class="py-3 px-4 border-b border-olivine-2">
+                                                <span class="px-2 py-1 rounded-full text-xs font-semibold <?php echo $bid['is_proxy_bid'] ? 'bg-blue-200 text-blue-800' : 'bg-green-200 text-green-800'; ?>">
+                                                    <?php echo $bid['is_proxy_bid'] ? 'Proxy' : 'Direct'; ?>
+                                                </span>
+                                                <?php if ($bid['is_proxy_bid'] && $bid['proxy_max_amount'] !== NULL): ?>
+                                                    <span class="text-xs text-gray-500">(Max: $<?php echo number_format($bid['proxy_max_amount'], 2); ?>)</span>
+                                                <?php endif; ?>
+                                            </td>
                                             <td class="py-3 px-4 border-b border-olivine-2 text-sm text-gray-600"><?php echo date('M j, Y H:i:s', strtotime($bid['bid_time'])); ?></td>
                                         </tr>
                                     <?php endforeach; ?>
