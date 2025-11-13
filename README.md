@@ -1,7 +1,7 @@
 Online Auction System
 A comprehensive web-based platform for conducting online auctions, allowing users to list items for sale, browse and bid on auctions, manage their profiles, communicate with other users, and access administrative tools.
 Table of Contents
-Features Implemented
+Features Implemented:
 Core Auction Functionality
 User Management & Experience
 Messaging System
